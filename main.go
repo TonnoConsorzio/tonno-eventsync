@@ -19,7 +19,7 @@ import (
 	"code.vikunja.io/api/pkg/user"
 )
 
-// Config holds the configuration settings loaded from environment variables.
+// Configurazione base
 var config = struct {
 	MacroProjectName    string
 	MacroProjectID      int64
@@ -34,115 +34,113 @@ var config = struct {
 	TemplateProjectName: "🎪 | Nuovo Evento",
 }
 
-// EventSyncMapping rappresenta la mappatura tra un task padre e il suo sotto-progetto operativo.
+// ---------------------------------------------------------
+// STRUTTURE DATABASE (Tag puliti per compatibilità Yaegi)
+// ---------------------------------------------------------
+
 type EventSyncMapping struct {
 	TaskID    int64     `xorm:"pk"`
 	ProjectID int64     `xorm:"unique"`
 	Created   time.Time `xorm:"created"`
 }
 
-func (EventSyncMapping) TableName() string {
-	return "tonno_eventsync_mappings"
-}
+func (EventSyncMapping) TableName() string { return "tonno_eventsync_mappings" }
 
-// Project rappresenta i campi reali della tabella projects di Vikunja.
 type Project struct {
-	ID              int64     `xorm:"bigint autoincr pk"`
-	Title           string    `xorm:"varchar(250) not null"`
+	ID              int64     `xorm:"pk autoincr"`
+	Title           string    `xorm:"not null"`
 	Description     string    `xorm:"text"`
-	OwnerID         int64     `xorm:"bigint"`
-	ParentProjectID int64     `xorm:"bigint"`
+	OwnerID         int64     `xorm:"index"`
+	ParentProjectID int64     `xorm:"index"`
 	Identifier      string    `xorm:"varchar(250)"`
 	IsArchived      bool      `xorm:"not null default false"`
 	Created         time.Time `xorm:"created"`
 	Updated         time.Time `xorm:"updated"`
 }
 
-func (Project) TableName() string {
-	return "projects"
-}
+func (Project) TableName() string { return "projects" }
 
-// Bucket rappresenta le colonne Kanban di Vikunja.
-type Bucket struct {
-	ID        int64     `xorm:"bigint autoincr pk"`
-	Title     string    `xorm:"text not null"`
-	ProjectID int64     `xorm:"bigint not null"`
+type ProjectView struct {
+	ID        int64     `xorm:"pk autoincr"`
+	ProjectID int64     `xorm:"not null index"`
+	Title     string    `xorm:"text"`
+	ViewKind  int64     `xorm:"int"`
 	Position  float64   `xorm:"double"`
 	Created   time.Time `xorm:"created"`
 	Updated   time.Time `xorm:"updated"`
 }
 
-func (Bucket) TableName() string {
-	return "buckets"
+func (ProjectView) TableName() string { return "project_views" }
+
+type Bucket struct {
+	ID            int64     `xorm:"pk autoincr"`
+	Title         string    `xorm:"text not null"`
+	ProjectViewID int64     `xorm:"not null index"`
+	Position      float64   `xorm:"double"`
+	CreatedByID   int64     `xorm:"created_by_id not null"` // <--- AGGIUNGI QUESTA
+	Created       time.Time `xorm:"created"`
+	Updated       time.Time `xorm:"updated"`
 }
 
-// Task rappresenta i campi reali della tabella tasks di Vikunja (Incluso BucketID).
+func (Bucket) TableName() string { return "buckets" }
+
 type Task struct {
-	ID          int64     `xorm:"bigint autoincr pk"`
+	ID          int64     `xorm:"pk autoincr"`
 	Title       string    `xorm:"text not null"`
 	Description string    `xorm:"text"`
-	Done        bool      `xorm:"index null"`
-	DoneAt      time.Time `xorm:"index null"`
-	Priority    int64     `xorm:"bigint"`
-	ProjectID   int64     `xorm:"bigint not null"`
-	BucketID    int64     `xorm:"bigint null"` // ID della colonna Kanban di appartenenza
+	Done        bool      `xorm:"index"`
+	DoneAt      time.Time `xorm:"index"`
+	Priority    int64     `xorm:"index"`
+	ProjectID   int64     `xorm:"not null index"`
+	BucketID    int64     `xorm:"index"`
 	Created     time.Time `xorm:"created"`
 	Updated     time.Time `xorm:"updated"`
 }
 
-func (Task) TableName() string {
-	return "tasks"
-}
+func (Task) TableName() string { return "tasks" }
 
-// TaskRelation gestisce i collegamenti e i sotto-task in Vikunja.
 type TaskRelation struct {
-	ID           int64  `xorm:"bigint autoincr pk"`
-	TaskID       int64  `xorm:"bigint not null"`
-	OtherTaskID  int64  `xorm:"bigint not null"`
+	ID           int64  `xorm:"pk autoincr"`
+	TaskID       int64  `xorm:"not null index"`
+	OtherTaskID  int64  `xorm:"not null index"`
 	RelationKind string `xorm:"varchar(255) not null"`
 }
 
-func (TaskRelation) TableName() string {
-	return "task_relations"
-}
+func (TaskRelation) TableName() string { return "task_relations" }
 
-// TaskAssignee rappresenta le assegnazioni degli utenti ai task.
 type TaskAssignee struct {
-	TaskID  int64     `xorm:"not null"`
-	UserID  int64     `xorm:"not null"`
+	TaskID  int64     `xorm:"not null pk"`
+	UserID  int64     `xorm:"not null pk"`
 	Created time.Time `xorm:"created"`
 }
 
-func (TaskAssignee) TableName() string {
-	return "task_assignees"
-}
+func (TaskAssignee) TableName() string { return "task_assignees" }
+
+// ---------------------------------------------------------
+// INIZIALIZZAZIONE PLUG-IN
+// ---------------------------------------------------------
 
 type TonnoEventSyncPlugin struct{}
 
-var (
-	_ plugins.Plugin = (*TonnoEventSyncPlugin)(nil)
-)
-
+var _ plugins.Plugin = (*TonnoEventSyncPlugin)(nil)
 var singleton = &TonnoEventSyncPlugin{}
 
-func NewPlugin() plugins.Plugin {
-	return singleton
-}
+func NewPlugin() plugins.Plugin { return singleton }
 
 func (p *TonnoEventSyncPlugin) Name() string    { return "tonno-eventsync" }
 func (p *TonnoEventSyncPlugin) Version() string { return "1.0.0" }
 
 func (p *TonnoEventSyncPlugin) Init() error {
 	log.Infof("Initializing %s version %s", p.Name(), p.Version())
-	
+
 	s := db.NewSession()
 	defer s.Close()
-	
+
 	if err := s.Begin(); err != nil {
-		log.Errorf("[tonno-eventsync] Failed to begin database transaction: %v", err)
+		log.Errorf("[tonno-eventsync] Failed to begin db transaction: %v", err)
 		return err
 	}
-	
+
 	_, err := s.Exec(`
 	CREATE TABLE IF NOT EXISTS tonno_eventsync_mappings (
 		task_id BIGINT PRIMARY KEY NOT NULL,
@@ -151,16 +149,16 @@ func (p *TonnoEventSyncPlugin) Init() error {
 	);
 	`)
 	if err != nil {
-		log.Errorf("[tonno-eventsync] Failed to create database table via raw SQL: %v", err)
+		log.Errorf("[tonno-eventsync] Failed to create db table: %v", err)
 		s.Rollback()
 		return err
 	}
-	
+
 	if err := s.Commit(); err != nil {
-		log.Errorf("[tonno-eventsync] Failed to commit database transaction: %v", err)
+		log.Errorf("[tonno-eventsync] Failed to commit: %v", err)
 		return err
 	}
-	
+
 	if val := os.Getenv("VIKUNJA_EVENT_MACRO_PROJECT_NAME"); val != "" {
 		config.MacroProjectName = val
 	}
@@ -183,12 +181,12 @@ func (p *TonnoEventSyncPlugin) Init() error {
 			config.TemplateProjectID = id
 		}
 	}
-	
+
 	events.RegisterListener("task.created", &TaskCreatedListener{})
 	events.RegisterListener("task.updated", &TaskUpdatedListener{})
 	events.RegisterListener("project.updated", &ProjectUpdatedListener{})
 	events.RegisterListener("task.assignee.created", &TaskAssigneeCreatedListener{})
-	
+
 	return nil
 }
 
@@ -196,6 +194,10 @@ func (p *TonnoEventSyncPlugin) Shutdown() error {
 	log.Infof("Shutting down %s", p.Name())
 	return nil
 }
+
+// ---------------------------------------------------------
+// LOGICA EVENTI
+// ---------------------------------------------------------
 
 type TaskCreatedListener struct{}
 
@@ -205,17 +207,17 @@ func (l *TaskCreatedListener) Handle(msg *message.Message) error {
 		log.Errorf("[tonno-eventsync] Failed to unmarshal TaskCreatedEvent: %v", err)
 		return err
 	}
-	
+
 	if event.Task == nil {
 		return nil
 	}
-	
+
 	s := db.NewSession()
 	defer s.Close()
 	if err := s.Begin(); err != nil {
 		return err
 	}
-	
+
 	var macroProjID int64
 	if config.MacroProjectID > 0 {
 		macroProjID = config.MacroProjectID
@@ -230,23 +232,18 @@ func (l *TaskCreatedListener) Handle(msg *message.Message) error {
 			macroProjID = p.ID
 		}
 	}
-	
-	if macroProjID == 0 {
+
+	if macroProjID == 0 || event.Task.ProjectID != macroProjID {
 		s.Rollback()
 		return nil
 	}
-	
-	if event.Task.ProjectID != macroProjID {
-		s.Rollback()
-		return nil
-	}
-	
+
 	if event.Task.BucketID > 0 {
-		type Bucket struct {
+		type BucketCheck struct {
 			ID    int64  `xorm:"id"`
 			Title string `xorm:"title"`
 		}
-		var b Bucket
+		var b BucketCheck
 		has, err := s.Table("buckets").Where("id = ?", event.Task.BucketID).Get(&b)
 		if err != nil {
 			s.Rollback()
@@ -260,24 +257,20 @@ func (l *TaskCreatedListener) Handle(msg *message.Message) error {
 		s.Rollback()
 		return nil
 	}
-	
+
 	var existing EventSyncMapping
 	hasMap, err := s.Table("tonno_eventsync_mappings").Where("task_id = ?", event.Task.ID).Get(&existing)
-	if err != nil {
+	if err != nil || hasMap {
 		s.Rollback()
 		return err
 	}
-	if hasMap {
-		s.Rollback()
-		return nil
-	}
-	
+
 	evtIdentifier, err := getUniqueProjectIdentifier()
 	if err != nil {
 		s.Rollback()
 		return err
 	}
-	
+
 	var ownerID int64
 	if event.Doer != nil && event.Doer.ID > 0 {
 		ownerID = event.Doer.ID
@@ -293,7 +286,7 @@ func (l *TaskCreatedListener) Handle(msg *message.Message) error {
 			ownerID = 1
 		}
 	}
-	
+
 	newProj := Project{
 		Title:           event.Task.Title,
 		ParentProjectID: macroProjID,
@@ -306,7 +299,7 @@ func (l *TaskCreatedListener) Handle(msg *message.Message) error {
 		s.Rollback()
 		return fmt.Errorf("failed to insert new sub-project: %w", err)
 	}
-	
+
 	mapping := EventSyncMapping{
 		TaskID:    event.Task.ID,
 		ProjectID: newProj.ID,
@@ -316,10 +309,7 @@ func (l *TaskCreatedListener) Handle(msg *message.Message) error {
 		s.Rollback()
 		return fmt.Errorf("failed to insert mapping: %w", err)
 	}
-	
-	// =================================================================
-	// 🎡 CLONAZIONE DEL LAYOUT KANBAN (COLONNE) E DEI TASK CORRELATI
-	// =================================================================
+
 	var templateProjID int64
 	if config.TemplateProjectID > 0 {
 		templateProjID = config.TemplateProjectID
@@ -330,50 +320,68 @@ func (l *TaskCreatedListener) Handle(msg *message.Message) error {
 			templateProjID = p.ID
 			log.Infof("[tonno-eventsync] Progetto Modello trovato con ID: %d", templateProjID)
 		} else {
-			log.Infof("[tonno-eventsync] [WARN] Impossibile trovare il modello chiamato '%s'.", config.TemplateProjectName)
+			log.Infof("[tonno-eventsync] [WARN] Modello '%s' non trovato.", config.TemplateProjectName)
 		}
 	}
-	
+
 	if templateProjID > 0 {
-		// 1. Recuperiamo ed inseriamo tutte le colonne (Buckets) del template
-		var templateBuckets []Bucket
-		if err := s.Table("buckets").Where("project_id = ?", templateProjID).Asc("position").Find(&templateBuckets); err != nil {
+		var templateViews []ProjectView
+		if err := s.Table("project_views").Where("project_id = ?", templateProjID).Find(&templateViews); err != nil {
 			s.Rollback()
-			return fmt.Errorf("failed to fetch template buckets: %w", err)
+			return fmt.Errorf("failed to fetch template views: %w", err)
 		}
 
-		log.Infof("[tonno-eventsync] Trovate %d colonne da clonare.", len(templateBuckets))
-		
-		// Mappa per convertire i vecchi BucketID nei nuovi BucketID appena generati
 		bucketMap := make(map[int64]int64)
-		
-		for _, tBucket := range templateBuckets {
-			newBucket := Bucket{
-				Title:     tBucket.Title,
-				ProjectID: newProj.ID, // Agganciata al nuovo sotto-progetto
-				Position:  tBucket.Position,
+
+		for _, tView := range templateViews {
+			newView := ProjectView{
+				ProjectID: newProj.ID,
+				Title:     tView.Title,
+				ViewKind:  tView.ViewKind,
+				Position:  tView.Position,
 				Created:   time.Now(),
 				Updated:   time.Now(),
 			}
-			if _, err := s.Table("buckets").Insert(&newBucket); err != nil {
+			if _, err := s.Table("project_views").Insert(&newView); err != nil {
 				s.Rollback()
-				return fmt.Errorf("failed to insert cloned bucket: %w", err)
+				return fmt.Errorf("failed to insert new view: %w", err)
 			}
-			// Salviamo la corrispondenza degli ID
-			bucketMap[tBucket.ID] = newBucket.ID
+
+			var templateBuckets []Bucket
+			if err := s.Table("buckets").Where("project_view_id = ?", tView.ID).Asc("position").Find(&templateBuckets); err != nil {
+				s.Rollback()
+				return fmt.Errorf("failed to fetch buckets: %w", err)
+			}
+
+			for _, tBucket := range templateBuckets {
+				newBucket := Bucket{
+					Title:         tBucket.Title,
+					ProjectViewID: newView.ID,
+					Position:      tBucket.Position,
+					CreatedByID:   ownerID,    // <--- AGGIUNGI QUESTA
+					Created:       time.Now(),
+					Updated:       time.Now(),
+				}
+				if _, err := s.Table("buckets").Insert(&newBucket); err != nil {
+					s.Rollback()
+					return fmt.Errorf("failed to insert cloned bucket: %w", err)
+				}
+				bucketMap[tBucket.ID] = newBucket.ID
+			}
 		}
 
-		// 2. Recuperiamo ed inseriamo i task, assegnandoli alla colonna corretta
 		var templateTasks []Task
 		if err := s.Table("tasks").Where("project_id = ?", templateProjID).Find(&templateTasks); err != nil {
 			s.Rollback()
 			return fmt.Errorf("failed to fetch template tasks: %w", err)
 		}
-		
+
+		log.Infof("[tonno-eventsync] Creazione di %d task clonati dal modello.", len(templateTasks))
+
 		for _, tTask := range templateTasks {
-			var assignedBucketID int64
+			var mappedBucketID int64
 			if tTask.BucketID > 0 {
-				assignedBucketID = bucketMap[tTask.BucketID]
+				mappedBucketID = bucketMap[tTask.BucketID]
 			}
 
 			clonedTask := Task{
@@ -381,7 +389,7 @@ func (l *TaskCreatedListener) Handle(msg *message.Message) error {
 				Description: tTask.Description,
 				Priority:    tTask.Priority,
 				ProjectID:   newProj.ID,
-				BucketID:    assignedBucketID, // ✨ Posiziona il task nella colonna speculare corretta
+				BucketID:    mappedBucketID,
 				Created:     time.Now(),
 				Updated:     time.Now(),
 			}
@@ -389,119 +397,100 @@ func (l *TaskCreatedListener) Handle(msg *message.Message) error {
 				s.Rollback()
 				return fmt.Errorf("failed to insert cloned task: %w", err)
 			}
-			
-			// Collega i sotto-task relazionali alla card madre
+
 			relSub := TaskRelation{
 				TaskID:       event.Task.ID,
 				OtherTaskID:  clonedTask.ID,
 				RelationKind: "subtask",
 			}
-			_, _ = s.Table("task_relations").Insert(&relSub)
-			
+			if _, err := s.Table("task_relations").Insert(&relSub); err != nil {
+				s.Rollback()
+				return fmt.Errorf("failed to link subtask relation: %w", err)
+			}
+
 			relParent := TaskRelation{
 				TaskID:       clonedTask.ID,
 				OtherTaskID:  event.Task.ID,
 				RelationKind: "parenttask",
 			}
-			_, _ = s.Table("task_relations").Insert(&relParent)
+			if _, err := s.Table("task_relations").Insert(&relParent); err != nil {
+				s.Rollback()
+				return fmt.Errorf("failed to link parenttask relation: %w", err)
+			}
 		}
-		log.Infof("[tonno-eventsync] Colonne e relativi task clonati e mappati con successo.")
+		log.Infof("[tonno-eventsync] Sincronizzazione gerarchica completata!")
 	}
-	
+
 	return s.Commit()
 }
 
-func (l *TaskCreatedListener) Name() string {
-	return "tonno-eventsync-task-created"
-}
+func (l *TaskCreatedListener) Name() string { return "tonno-eventsync-task-created" }
 
 type TaskUpdatedListener struct{}
 
 func (l *TaskUpdatedListener) Handle(msg *message.Message) error {
 	var event models.TaskUpdatedEvent
 	if err := json.Unmarshal(msg.Payload, &event); err != nil {
-		log.Errorf("[tonno-eventsync] Failed to unmarshal TaskUpdatedEvent: %v", err)
 		return err
 	}
-	
 	if event.Task == nil {
 		return nil
 	}
-	
+
 	s := db.NewSession()
 	defer s.Close()
 	if err := s.Begin(); err != nil {
 		return err
 	}
-	
+
 	var mapping EventSyncMapping
 	has, err := s.Table("tonno_eventsync_mappings").Where("task_id = ?", event.Task.ID).Get(&mapping)
-	if err != nil {
+	if err != nil || !has {
 		s.Rollback()
 		return err
 	}
-	
-	if !has {
-		s.Rollback()
-		return nil
-	}
-	
+
 	var proj Project
 	hasProj, err := s.Table("projects").Where("id = ?", mapping.ProjectID).Get(&proj)
 	if err != nil {
 		s.Rollback()
 		return err
 	}
-	
+
 	if hasProj && proj.Title != event.Task.Title {
 		projUpdate := struct {
 			Title string `xorm:"title"`
-		}{
-			Title: event.Task.Title,
-		}
-		_, err = s.Table("projects").Where("id = ?", proj.ID).Cols("title").Update(&projUpdate)
-		if err != nil {
-			s.Rollback()
-			return fmt.Errorf("failed to update project title: %w", err)
-		}
-		log.Infof("[tonno-eventsync] Synchronized project title to '%s'", event.Task.Title)
-		proj.Title = event.Task.Title
-	}
-	
-	if event.Task.BucketID > 0 {
-		type Bucket struct {
-			ID    int64  `xorm:"id"`
-			Title string `xorm:"title"`
-		}
-		var b Bucket
-		hasBucket, err := s.Table("buckets").Where("id = ?", event.Task.BucketID).Get(&b)
-		if err != nil {
+		}{Title: event.Task.Title}
+		if _, err = s.Table("projects").Where("id = ?", proj.ID).Cols("title").Update(&projUpdate); err != nil {
 			s.Rollback()
 			return err
 		}
-		if hasBucket && strings.EqualFold(b.Title, config.ConcludedColumnName) {
+		proj.Title = event.Task.Title
+	}
+
+	if event.Task.BucketID > 0 {
+		type BucketCheck struct {
+			ID    int64  `xorm:"id"`
+			Title string `xorm:"title"`
+		}
+		var b BucketCheck
+		if hasBucket, _ := s.Table("buckets").Where("id = ?", event.Task.BucketID).Get(&b); hasBucket && strings.EqualFold(b.Title, config.ConcludedColumnName) {
 			if hasProj && !proj.IsArchived {
 				projUpdate := struct {
 					IsArchived bool `xorm:"is_archived"`
-				}{
-					IsArchived: true,
-				}
-				_, err = s.Table("projects").Where("id = ?", proj.ID).Cols("is_archived").Update(&projUpdate)
-				if err != nil {
+				}{IsArchived: true}
+				if _, err = s.Table("projects").Where("id = ?", proj.ID).Cols("is_archived").Update(&projUpdate); err != nil {
 					s.Rollback()
-					return fmt.Errorf("failed to archive project: %w", err)
+					return err
 				}
-				log.Infof("[tonno-eventsync] Archived project '%s' as task moved to '%s'", proj.Title, b.Title)
 			}
 		}
 	}
-	
+
 	return s.Commit()
 }
 
-func (l *TaskUpdatedListener) Name() string {
-	return "tonno-eventsync-task-updated"
-}
+func (l *TaskUpdatedListener) Name() string { return "tonno-eventsync-task-updated" }
 
 type ProjectUpdatedListener struct{}
 
@@ -510,117 +499,90 @@ func (l *ProjectUpdatedListener) Handle(msg *message.Message) error {
 		Project *models.Project `json:"project"`
 	}
 	if err := json.Unmarshal(msg.Payload, &event); err != nil {
-		log.Errorf("[tonno-eventsync] Failed to unmarshal ProjectUpdatedEvent: %v", err)
 		return err
 	}
-	
 	if event.Project == nil {
 		return nil
 	}
-	
+
 	s := db.NewSession()
 	defer s.Close()
 	if err := s.Begin(); err != nil {
 		return err
 	}
-	
+
 	var mapping EventSyncMapping
-	has, err := s.Table("tonno_eventsync_mappings").Where("project_id = ?", event.Project.ID).Get(&mapping)
-	if err != nil {
+	if has, err := s.Table("tonno_eventsync_mappings").Where("project_id = ?", event.Project.ID).Get(&mapping); err != nil || !has {
 		s.Rollback()
 		return err
 	}
-	
-	if !has {
-		s.Rollback()
-		return nil
-	}
-	
+
 	var task Task
-	hasTask, err := s.Table("tasks").Where("id = ?", mapping.TaskID).Get(&task)
-	if err != nil {
+	if hasTask, err := s.Table("tasks").Where("id = ?", mapping.TaskID).Get(&task); err != nil || !hasTask {
 		s.Rollback()
 		return err
 	}
-	
-	if hasTask && task.Title != event.Project.Title {
+
+	if task.Title != event.Project.Title {
 		taskUpdate := struct {
 			Title string `xorm:"title"`
-		}{
-			Title: event.Project.Title,
-		}
-		_, err = s.Table("tasks").Where("id = ?", task.ID).Cols("title").Update(&taskUpdate)
-		if err != nil {
+		}{Title: event.Project.Title}
+		if _, err := s.Table("tasks").Where("id = ?", task.ID).Cols("title").Update(&taskUpdate); err != nil {
 			s.Rollback()
-			return fmt.Errorf("failed to update task title: %w", err)
+			return err
 		}
-		log.Infof("[tonno-eventsync] Synchronized task title to '%s'", event.Project.Title)
 	}
-	
+
 	return s.Commit()
 }
 
-func (l *ProjectUpdatedListener) Name() string {
-	return "tonno-eventsync-project-updated"
-}
+func (l *ProjectUpdatedListener) Name() string { return "tonno-eventsync-project-updated" }
 
 type TaskAssigneeCreatedListener struct{}
 
 func (l *TaskAssigneeCreatedListener) Handle(msg *message.Message) error {
 	var event models.TaskAssigneeCreatedEvent
 	if err := json.Unmarshal(msg.Payload, &event); err != nil {
-		log.Errorf("[tonno-eventsync] Failed to unmarshal TaskAssigneeCreatedEvent: %v", err)
 		return err
 	}
-	
 	if event.Task == nil || event.Assignee == nil {
 		return nil
 	}
-	
+
 	s := db.NewSession()
 	defer s.Close()
 	if err := s.Begin(); err != nil {
 		return err
 	}
-	
+
 	var mapping EventSyncMapping
-	has, err := s.Table("tonno_eventsync_mappings").Where("project_id = ?", event.Task.ProjectID).Get(&mapping)
-	if err != nil {
+	if has, err := s.Table("tonno_eventsync_mappings").Where("project_id = ?", event.Task.ProjectID).Get(&mapping); err != nil || !has {
 		s.Rollback()
 		return err
 	}
-	
-	if !has {
-		s.Rollback()
-		return nil
-	}
-	
+
 	exists, err := s.Table("task_assignees").Where("task_id = ? AND user_id = ?", mapping.TaskID, event.Assignee.ID).Exist()
 	if err != nil {
 		s.Rollback()
 		return err
 	}
-	
+
 	if !exists {
 		newAssignee := TaskAssignee{
 			TaskID:  mapping.TaskID,
 			UserID:  event.Assignee.ID,
 			Created: time.Now(),
 		}
-		_, err = s.Table("task_assignees").Insert(&newAssignee)
-		if err != nil {
+		if _, err = s.Table("task_assignees").Insert(&newAssignee); err != nil {
 			s.Rollback()
-			return fmt.Errorf("failed to assign user to parent task: %w", err)
+			return err
 		}
-		log.Infof("[tonno-eventsync] Assigned user %d to parent task %d", event.Assignee.ID, mapping.TaskID)
 	}
-	
+
 	return s.Commit()
 }
 
-func (l *TaskAssigneeCreatedListener) Name() string {
-	return "tonno-eventsync-task-assignee-created"
-}
+func (l *TaskAssigneeCreatedListener) Name() string { return "tonno-eventsync-task-assignee-created" }
 
 func getUniqueProjectIdentifier() (string, error) {
 	const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -641,5 +603,5 @@ func getUniqueProjectIdentifier() (string, error) {
 			return idStr, nil
 		}
 	}
-	return "", fmt.Errorf("failed to generate unique project identifier after 10 attempts")
+	return "", fmt.Errorf("failed to generate identifier")
 }
