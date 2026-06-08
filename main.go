@@ -62,7 +62,21 @@ func (Project) TableName() string {
 	return "projects"
 }
 
-// Task rappresenta i campi reali della tabella tasks di Vikunja (Rimosso parent_task_id che rompeva la query).
+// Bucket rappresenta le colonne Kanban di Vikunja.
+type Bucket struct {
+	ID        int64     `xorm:"bigint autoincr pk"`
+	Title     string    `xorm:"text not null"`
+	ProjectID int64     `xorm:"bigint not null"`
+	Position  float64   `xorm:"double"`
+	Created   time.Time `xorm:"created"`
+	Updated   time.Time `xorm:"updated"`
+}
+
+func (Bucket) TableName() string {
+	return "buckets"
+}
+
+// Task rappresenta i campi reali della tabella tasks di Vikunja (Incluso BucketID).
 type Task struct {
 	ID          int64     `xorm:"bigint autoincr pk"`
 	Title       string    `xorm:"text not null"`
@@ -71,6 +85,7 @@ type Task struct {
 	DoneAt      time.Time `xorm:"index null"`
 	Priority    int64     `xorm:"bigint"`
 	ProjectID   int64     `xorm:"bigint not null"`
+	BucketID    int64     `xorm:"bigint null"` // ID della colonna Kanban di appartenenza
 	Created     time.Time `xorm:"created"`
 	Updated     time.Time `xorm:"updated"`
 }
@@ -302,6 +317,9 @@ func (l *TaskCreatedListener) Handle(msg *message.Message) error {
 		return fmt.Errorf("failed to insert mapping: %w", err)
 	}
 	
+	// =================================================================
+	// 🎡 CLONAZIONE DEL LAYOUT KANBAN (COLONNE) E DEI TASK CORRELATI
+	// =================================================================
 	var templateProjID int64
 	if config.TemplateProjectID > 0 {
 		templateProjID = config.TemplateProjectID
@@ -310,27 +328,60 @@ func (l *TaskCreatedListener) Handle(msg *message.Message) error {
 		has, err := s.Table("projects").Where("title = ?", config.TemplateProjectName).Get(&p)
 		if err == nil && has {
 			templateProjID = p.ID
-			log.Infof("[tonno-eventsync] Progetto Modello trovato con ID database: %d", templateProjID)
+			log.Infof("[tonno-eventsync] Progetto Modello trovato con ID: %d", templateProjID)
 		} else {
-			log.Infof("[tonno-eventsync] [WARN] Impossibile trovare un progetto modello chiamato esattamente '%s'.", config.TemplateProjectName)
+			log.Infof("[tonno-eventsync] [WARN] Impossibile trovare il modello chiamato '%s'.", config.TemplateProjectName)
 		}
 	}
 	
 	if templateProjID > 0 {
+		// 1. Recuperiamo ed inseriamo tutte le colonne (Buckets) del template
+		var templateBuckets []Bucket
+		if err := s.Table("buckets").Where("project_id = ?", templateProjID).Asc("position").Find(&templateBuckets); err != nil {
+			s.Rollback()
+			return fmt.Errorf("failed to fetch template buckets: %w", err)
+		}
+
+		log.Infof("[tonno-eventsync] Trovate %d colonne da clonare.", len(templateBuckets))
+		
+		// Mappa per convertire i vecchi BucketID nei nuovi BucketID appena generati
+		bucketMap := make(map[int64]int64)
+		
+		for _, tBucket := range templateBuckets {
+			newBucket := Bucket{
+				Title:     tBucket.Title,
+				ProjectID: newProj.ID, // Agganciata al nuovo sotto-progetto
+				Position:  tBucket.Position,
+				Created:   time.Now(),
+				Updated:   time.Now(),
+			}
+			if _, err := s.Table("buckets").Insert(&newBucket); err != nil {
+				s.Rollback()
+				return fmt.Errorf("failed to insert cloned bucket: %w", err)
+			}
+			// Salviamo la corrispondenza degli ID
+			bucketMap[tBucket.ID] = newBucket.ID
+		}
+
+		// 2. Recuperiamo ed inseriamo i task, assegnandoli alla colonna corretta
 		var templateTasks []Task
 		if err := s.Table("tasks").Where("project_id = ?", templateProjID).Find(&templateTasks); err != nil {
 			s.Rollback()
 			return fmt.Errorf("failed to fetch template tasks: %w", err)
 		}
 		
-		log.Infof("[tonno-eventsync] Trovati %d task da clonare dal modello.", len(templateTasks))
-		
 		for _, tTask := range templateTasks {
+			var assignedBucketID int64
+			if tTask.BucketID > 0 {
+				assignedBucketID = bucketMap[tTask.BucketID]
+			}
+
 			clonedTask := Task{
 				Title:       tTask.Title,
 				Description: tTask.Description,
 				Priority:    tTask.Priority,
-				ProjectID:   newProj.ID, // Inserito nel nuovo sotto-progetto
+				ProjectID:   newProj.ID,
+				BucketID:    assignedBucketID, // ✨ Posiziona il task nella colonna speculare corretta
 				Created:     time.Now(),
 				Updated:     time.Now(),
 			}
@@ -339,30 +390,22 @@ func (l *TaskCreatedListener) Handle(msg *message.Message) error {
 				return fmt.Errorf("failed to insert cloned task: %w", err)
 			}
 			
-			// 🔗 SCRITTURA DELLA RELAZIONE SOTTO-TASK NELLA TABELLA DI COLLEGAMENTO
-			// Relazione 1: La Card Madre dichiara che questo task clonato è un suo "subtask"
+			// Collega i sotto-task relazionali alla card madre
 			relSub := TaskRelation{
 				TaskID:       event.Task.ID,
 				OtherTaskID:  clonedTask.ID,
 				RelationKind: "subtask",
 			}
-			if _, err := s.Table("task_relations").Insert(&relSub); err != nil {
-				s.Rollback()
-				return fmt.Errorf("failed to link subtask relation: %w", err)
-			}
+			_, _ = s.Table("task_relations").Insert(&relSub)
 			
-			// Relazione 2: Il task clonato dichiara che la Card Madre è il suo "parenttask"
 			relParent := TaskRelation{
 				TaskID:       clonedTask.ID,
 				OtherTaskID:  event.Task.ID,
 				RelationKind: "parenttask",
 			}
-			if _, err := s.Table("task_relations").Insert(&relParent); err != nil {
-				s.Rollback()
-				return fmt.Errorf("failed to link parenttask relation: %w", err)
-			}
+			_, _ = s.Table("task_relations").Insert(&relParent)
 		}
-		log.Infof("[tonno-eventsync] Clonazione completata e sotto-task collegati alla card madre via task_relations.")
+		log.Infof("[tonno-eventsync] Colonne e relativi task clonati e mappati con successo.")
 	}
 	
 	return s.Commit()
