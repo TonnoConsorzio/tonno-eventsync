@@ -77,7 +77,7 @@ type Bucket struct {
 	Title         string    `xorm:"text not null"`
 	ProjectViewID int64     `xorm:"not null index"`
 	Position      float64   `xorm:"double"`
-	CreatedByID   int64     `xorm:"created_by_id not null"` // <--- AGGIUNGI QUESTA
+	CreatedByID   int64     `xorm:"created_by_id not null"` // Ripristinato per evitare not-null constraint
 	Created       time.Time `xorm:"created"`
 	Updated       time.Time `xorm:"updated"`
 }
@@ -90,9 +90,10 @@ type Task struct {
 	Description string    `xorm:"text"`
 	Done        bool      `xorm:"index"`
 	DoneAt      time.Time `xorm:"index"`
+	PercentDone float64   `xorm:"percent_done"`
 	Priority    int64     `xorm:"index"`
 	ProjectID   int64     `xorm:"not null index"`
-	BucketID    int64     `xorm:"index"`
+	CreatedByID int64     `xorm:"created_by_id not null"`
 	Created     time.Time `xorm:"created"`
 	Updated     time.Time `xorm:"updated"`
 }
@@ -100,10 +101,10 @@ type Task struct {
 func (Task) TableName() string { return "tasks" }
 
 type TaskRelation struct {
-	ID           int64  `xorm:"pk autoincr"`
-	TaskID       int64  `xorm:"not null index"`
-	OtherTaskID  int64  `xorm:"not null index"`
-	RelationKind string `xorm:"varchar(255) not null"`
+	ID           int64     `xorm:"pk autoincr"`
+	TaskID       int64     `xorm:"not null index"`
+	OtherTaskID  int64     `xorm:"not null index"`
+	RelationKind string    `xorm:"varchar(255) not null"`
 }
 
 func (TaskRelation) TableName() string { return "task_relations" }
@@ -187,6 +188,8 @@ func (p *TonnoEventSyncPlugin) Init() error {
 	events.RegisterListener("project.updated", &ProjectUpdatedListener{})
 	events.RegisterListener("task.assignee.created", &TaskAssigneeCreatedListener{})
 
+	go runRecoverySync()
+
 	return nil
 }
 
@@ -233,11 +236,65 @@ func (l *TaskCreatedListener) Handle(msg *message.Message) error {
 		}
 	}
 
-	if macroProjID == 0 || event.Task.ProjectID != macroProjID {
+	if macroProjID == 0 {
 		s.Rollback()
 		return nil
 	}
 
+	// 1. GESTIONE TASK CREATI DIRETTAMENTE NEL SOTTOPROGETTO
+	if event.Task.ProjectID != macroProjID {
+		var mapping EventSyncMapping
+		hasMap, err := s.Table("tonno_eventsync_mappings").Where("project_id = ?", event.Task.ProjectID).Get(&mapping)
+		if err == nil && hasMap {
+			var ownerID int64
+			if event.Doer != nil && event.Doer.ID > 0 {
+				ownerID = event.Doer.ID
+			} else {
+				ownerID = 1
+			}
+
+			// Collega come subtask
+			relSub := TaskRelation{
+				TaskID:       mapping.TaskID,
+				OtherTaskID:  event.Task.ID,
+				RelationKind: "subtask",
+			}
+			s.Table("task_relations").Insert(&relSub)
+
+			relParent := TaskRelation{
+				TaskID:       event.Task.ID,
+				OtherTaskID:  mapping.TaskID,
+				RelationKind: "parenttask",
+			}
+			s.Table("task_relations").Insert(&relParent)
+
+			// Ricalcola completamento
+			var allTasks []Task
+			if errTasks := s.Table("tasks").Where("project_id = ?", event.Task.ProjectID).Find(&allTasks); errTasks == nil {
+				var percentDone float64
+				if len(allTasks) > 0 {
+					var doneCount int
+					for _, t := range allTasks {
+						if t.Done || t.PercentDone >= 1 {
+							doneCount++
+						}
+					}
+					percentDone = float64(doneCount) / float64(len(allTasks))
+				}
+				type TaskPercentUpdate struct {
+					PercentDone float64 `xorm:"percent_done"`
+				}
+				s.Table("tasks").Where("id = ?", mapping.TaskID).Cols("percent_done").Update(&TaskPercentUpdate{PercentDone: percentDone})
+			}
+
+			return s.Commit()
+		}
+
+		s.Rollback()
+		return nil
+	}
+
+	// 2. GESTIONE TASK CREATO NEL PROGETTO PRINCIPALE (Clonazione)
 	if event.Task.BucketID > 0 {
 		type BucketCheck struct {
 			ID    int64  `xorm:"id"`
@@ -326,7 +383,7 @@ func (l *TaskCreatedListener) Handle(msg *message.Message) error {
 
 	if templateProjID > 0 {
 		var templateViews []ProjectView
-		if err := s.Table("project_views").Where("project_id = ?", templateProjID).Find(&templateViews); err != nil {
+		if err := s.SQL("SELECT id, project_id, title, view_kind, position, created, updated FROM project_views WHERE project_id = ?", templateProjID).Find(&templateViews); err != nil {
 			s.Rollback()
 			return fmt.Errorf("failed to fetch template views: %w", err)
 		}
@@ -335,12 +392,12 @@ func (l *TaskCreatedListener) Handle(msg *message.Message) error {
 
 		for _, tView := range templateViews {
 			newView := ProjectView{
-				ProjectID: newProj.ID,
-				Title:     tView.Title,
-				ViewKind:  tView.ViewKind,
-				Position:  tView.Position,
-				Created:   time.Now(),
-				Updated:   time.Now(),
+				ProjectID:   newProj.ID,
+				Title:       tView.Title,
+				ViewKind:    tView.ViewKind,
+				Position:    tView.Position,
+				Created:     time.Now(),
+				Updated:     time.Now(),
 			}
 			if _, err := s.Table("project_views").Insert(&newView); err != nil {
 				s.Rollback()
@@ -348,7 +405,7 @@ func (l *TaskCreatedListener) Handle(msg *message.Message) error {
 			}
 
 			var templateBuckets []Bucket
-			if err := s.Table("buckets").Where("project_view_id = ?", tView.ID).Asc("position").Find(&templateBuckets); err != nil {
+			if err := s.SQL("SELECT id, title, project_view_id, position, created, updated FROM buckets WHERE project_view_id = $1 ORDER BY position ASC", tView.ID).Find(&templateBuckets); err != nil {
 				s.Rollback()
 				return fmt.Errorf("failed to fetch buckets: %w", err)
 			}
@@ -358,7 +415,7 @@ func (l *TaskCreatedListener) Handle(msg *message.Message) error {
 					Title:         tBucket.Title,
 					ProjectViewID: newView.ID,
 					Position:      tBucket.Position,
-					CreatedByID:   ownerID,    // <--- AGGIUNGI QUESTA
+					CreatedByID:   ownerID,
 					Created:       time.Now(),
 					Updated:       time.Now(),
 				}
@@ -379,17 +436,12 @@ func (l *TaskCreatedListener) Handle(msg *message.Message) error {
 		log.Infof("[tonno-eventsync] Creazione di %d task clonati dal modello.", len(templateTasks))
 
 		for _, tTask := range templateTasks {
-			var mappedBucketID int64
-			if tTask.BucketID > 0 {
-				mappedBucketID = bucketMap[tTask.BucketID]
-			}
-
 			clonedTask := Task{
 				Title:       tTask.Title,
 				Description: tTask.Description,
 				Priority:    tTask.Priority,
 				ProjectID:   newProj.ID,
-				BucketID:    mappedBucketID,
+				CreatedByID: ownerID, // <--- AGGIUNGI QUESTA
 				Created:     time.Now(),
 				Updated:     time.Now(),
 			}
@@ -446,8 +498,32 @@ func (l *TaskUpdatedListener) Handle(msg *message.Message) error {
 	var mapping EventSyncMapping
 	has, err := s.Table("tonno_eventsync_mappings").Where("task_id = ?", event.Task.ID).Get(&mapping)
 	if err != nil || !has {
+		// Controllo se è un task DEL sottoprogetto (aggiornamento % completamento)
+		hasSub, errSub := s.Table("tonno_eventsync_mappings").Where("project_id = ?", event.Task.ProjectID).Get(&mapping)
+		if errSub == nil && hasSub {
+			// Ricalcola completamento
+			var allTasks []Task
+			if errTasks := s.Table("tasks").Where("project_id = ?", event.Task.ProjectID).Find(&allTasks); errTasks == nil {
+				var percentDone float64
+				if len(allTasks) > 0 {
+					var doneCount int
+					for _, t := range allTasks {
+						if t.Done || t.PercentDone >= 1 {
+							doneCount++
+						}
+					}
+					percentDone = float64(doneCount) / float64(len(allTasks))
+				}
+				type TaskPercentUpdate struct {
+					PercentDone float64 `xorm:"percent_done"`
+				}
+				s.Table("tasks").Where("id = ?", mapping.TaskID).Cols("percent_done").Update(&TaskPercentUpdate{PercentDone: percentDone})
+			}
+			return s.Commit()
+		}
+
 		s.Rollback()
-		return err
+		return nil
 	}
 
 	var proj Project
@@ -604,4 +680,127 @@ func getUniqueProjectIdentifier() (string, error) {
 		}
 	}
 	return "", fmt.Errorf("failed to generate identifier")
+}
+
+func runRecoverySync() {
+	time.Sleep(5 * time.Second) // Attendi che Vikunja sia avviato completamente
+
+	log.Infof("[tonno-eventsync] Starting recovery mega-sync...")
+
+	s := db.NewSession()
+	defer s.Close()
+
+	var macroProjID int64
+	if config.MacroProjectID > 0 {
+		macroProjID = config.MacroProjectID
+	} else {
+		var p Project
+		has, err := s.Table("projects").Where("title = ?", config.MacroProjectName).Get(&p)
+		if err != nil || !has {
+			log.Errorf("[tonno-eventsync] Recovery sync failed: MacroProject not found")
+			return
+		}
+		macroProjID = p.ID
+	}
+
+	var mainTasks []Task
+	if err := s.Table("tasks").Where("project_id = ?", macroProjID).Find(&mainTasks); err != nil {
+		log.Errorf("[tonno-eventsync] Recovery sync failed to fetch main tasks: %v", err)
+		return
+	}
+
+	for _, mainTask := range mainTasks {
+		var mapping EventSyncMapping
+		hasMap, err := s.Table("tonno_eventsync_mappings").Where("task_id = ?", mainTask.ID).Get(&mapping)
+		
+		var subProjectID int64
+
+		if err == nil && hasMap {
+			subProjectID = mapping.ProjectID
+		} else {
+			// Cerchiamo un progetto figlio con lo stesso titolo
+			var subProj Project
+			hasSub, errSub := s.Table("projects").
+				Where("parent_project_id = ? AND title = ?", macroProjID, mainTask.Title).
+				Get(&subProj)
+			
+			if errSub == nil && hasSub {
+				subProjectID = subProj.ID
+				
+				// Creiamo il mapping mancante
+				newMapping := EventSyncMapping{
+					TaskID:    mainTask.ID,
+					ProjectID: subProjectID,
+					Created:   time.Now(),
+				}
+				s.Table("tonno_eventsync_mappings").Insert(&newMapping)
+				log.Infof("[tonno-eventsync] Restored missing mapping for task '%s'", mainTask.Title)
+			}
+		}
+
+		if subProjectID > 0 {
+			var subTasks []Task
+			if err := s.Table("tasks").Where("project_id = ?", subProjectID).Find(&subTasks); err != nil {
+				continue
+			}
+
+			// Otteniamo il creatore della main task come default per i link
+			ownerID := int64(1)
+			if mainTask.CreatedByID > 0 {
+				ownerID = mainTask.CreatedByID
+			}
+
+			for _, subT := range subTasks {
+				// Verifica relazione subtask
+				existSub, _ := s.Table("task_relations").
+					Where("task_id = ? AND other_task_id = ? AND relation_kind = ?", mainTask.ID, subT.ID, "subtask").
+					Exist()
+				
+				if !existSub {
+					relSub := TaskRelation{
+						TaskID:       mainTask.ID,
+						OtherTaskID:  subT.ID,
+						RelationKind: "subtask",
+					}
+					s.Table("task_relations").Insert(&relSub)
+					log.Infof("[tonno-eventsync] Restored subtask relation for '%s'", subT.Title)
+				}
+
+				// Verifica relazione parenttask
+				existParent, _ := s.Table("task_relations").
+					Where("task_id = ? AND other_task_id = ? AND relation_kind = ?", subT.ID, mainTask.ID, "parenttask").
+					Exist()
+
+				if !existParent {
+					relParent := TaskRelation{
+						TaskID:       subT.ID,
+						OtherTaskID:  mainTask.ID,
+						RelationKind: "parenttask",
+					}
+					s.Table("task_relations").Insert(&relParent)
+				}
+			}
+
+			// Infine, ricalcoliamo il completamento per sistemarlo!
+			var allSubTasks []Task
+			if errTasks := s.Table("tasks").Where("project_id = ?", subProjectID).Find(&allSubTasks); errTasks == nil {
+				var percentDone float64
+				if len(allSubTasks) > 0 {
+					var doneCount int
+					for _, t := range allSubTasks {
+						if t.Done || t.PercentDone >= 1 {
+							doneCount++
+						}
+					}
+					percentDone = float64(doneCount) / float64(len(allSubTasks))
+				}
+				type TaskPercentUpdate struct {
+					PercentDone float64 `xorm:"percent_done"`
+				}
+				s.Table("tasks").Where("id = ?", mainTask.ID).Cols("percent_done").Update(&TaskPercentUpdate{PercentDone: percentDone})
+			}
+		}
+	}
+
+	log.Infof("[tonno-eventsync] Recovery mega-sync completed!")
 }
